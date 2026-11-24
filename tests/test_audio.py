@@ -1,3 +1,4 @@
+from collections import Counter
 from dataclasses import replace
 import unittest
 from unittest.mock import patch
@@ -8,7 +9,7 @@ import sounddevice as sd
 from audio_devices import Device, Endpoint, default_devices, group_devices
 from audio_engine import AudioBridge, AudioEngine
 from dsp import Controls, PitchTracker, PresetEffects, VoiceProcessor, nearest_note
-from presets import DEFAULT_PRESET, PRESETS, Preset
+from presets import CATEGORIES, DEFAULT_PRESET, PRESETS, Preset, Room
 
 
 RATE = 48000
@@ -21,12 +22,12 @@ def tone(freq, seconds=1, rate=RATE):
     return (.15 * np.sin(2 * np.pi * freq * time)).astype(np.float32)
 
 
-def process(samples, preset=BYPASS, controls=Controls(), rate=RATE):
+def process(samples, preset=BYPASS, controls=Controls(), rate=RATE, block=BLOCK):
     processor = VoiceProcessor(rate, controls.gain_db)
     effects = PresetEffects(preset, rate)
     return np.concatenate([
-        processor.process(samples[start:start + BLOCK], effects, controls)
-        for start in range(0, len(samples), BLOCK)
+        processor.process(samples[start:start + block], effects, controls)
+        for start in range(0, len(samples), block)
     ])
 
 
@@ -44,12 +45,12 @@ class DspTest(unittest.TestCase):
 
     def test_fifty_distinct_presets(self):
         self.assertEqual(len(PRESETS), 50)
-        self.assertTrue({
-            "Робот", "Демон", "Бурундук", "Анонимус", "Радио",
-            "Эхо", "Киборг", "Глубокий бас", "Гелий",
-        }.issubset(PRESETS))
+        self.assertEqual(CATEGORIES, ("Персонажи", "Монстры", "Роботы", "Связь", "Пространство"))
+        self.assertEqual(Counter(preset.category for preset in PRESETS.values()), dict.fromkeys(CATEGORIES, 10))
+        self.assertEqual(min(preset.pitch for preset in PRESETS.values()), -12)
+        self.assertEqual(max(preset.pitch for preset in PRESETS.values()), 12)
         rng = np.random.default_rng(42)
-        sample = tone(193, .45)
+        sample = tone(193, .55)
         sample += (.005 * rng.standard_normal(len(sample))).astype(np.float32)
         sample[round(.25 * RATE):] = 0
         fingerprints = set()
@@ -60,10 +61,24 @@ class DspTest(unittest.TestCase):
                 self.assertEqual(out.dtype, np.float32)
                 self.assertTrue(np.isfinite(out).all())
                 self.assertGreater(float(np.abs(out).max()), .001)
-                self.assertLessEqual(float(np.abs(out).max()), 1.)
+                self.assertLessEqual(float(np.abs(out).max()), .9)
                 self.assertFalse(np.allclose(out, sample))
                 fingerprints.add(out.round(4).tobytes())
         self.assertEqual(len(fingerprints), 50)
+
+    def test_all_presets_keep_headroom_with_loud_input_and_maximum_boost(self):
+        for rate, block in ((32000, 127), (44100, 257), (48000, 64)):
+            time = np.arange(round(.77 * rate)) / rate
+            narrow = np.sin(2 * np.pi * 187 * time)
+            signal = np.clip(.86 * narrow + .62 * np.sin(2 * np.pi * 1070 * time), -1, 1).astype(np.float32)
+            signal[round(.44 * rate):] = 0
+            for name, preset in PRESETS.items():
+                with self.subTest(rate=rate, preset=name):
+                    wet = process(signal, preset, Controls(gain_db=24), rate, block)
+                    self.assertEqual(wet.shape, signal.shape)
+                    self.assertTrue(np.isfinite(wet).all())
+                    self.assertLessEqual(float(np.abs(wet).max()), .9)
+                    self.assertGreater(np.max(np.abs(wet)), .003)
 
     def test_pitch_shift_and_scale_correction(self):
         for rate in (44100, 48000):
@@ -93,8 +108,9 @@ class DspTest(unittest.TestCase):
     def test_echo_tail_spans_blocks_without_a_dry_signal(self):
         impulse = np.zeros(RATE, dtype=np.float32)
         impulse[0] = .3
-        out = process(impulse, PRESETS["Эхо"])
-        repeat_at = round(RATE * PRESETS["Эхо"].echo_ms / 1000)
+        echo = replace(BYPASS, echo=.62, echo_ms=300)
+        out = process(impulse, echo)
+        repeat_at = round(RATE * echo.echo_ms / 1000)
         self.assertFalse(np.any(out[:repeat_at]))
         self.assertGreater(out[repeat_at], .1)
         self.assertGreater(out[2 * repeat_at], .025)
@@ -102,7 +118,7 @@ class DspTest(unittest.TestCase):
     def test_chorus_and_reverb_have_no_immediate_dry_signal(self):
         impulse = np.zeros(RATE // 10, dtype=np.float32)
         impulse[0] = .5
-        for parameters in ({"chorus": .5}, {"reverb": .5}):
+        for parameters in ({"chorus": .5}, {"room": Room(.7, 1.8, 6, 5000)}):
             with self.subTest(effect=parameters):
                 wet = process(impulse, replace(BYPASS, **parameters))
                 self.assertFalse(np.any(wet[:round(.002 * RATE)]))
@@ -110,15 +126,59 @@ class DspTest(unittest.TestCase):
 
     def test_preset_change_starts_at_previous_output_level(self):
         processor = VoiceProcessor(RATE)
-        robot = PresetEffects(PRESETS["Робот"], RATE)
-        echo = PresetEffects(PRESETS["Эхо"], RATE)
-        samples = tone(170)[:BLOCK]
-        previous = processor.process(samples, robot, Controls())
+        robot = PresetEffects(PRESETS[DEFAULT_PRESET], RATE)
+        echo = PresetEffects(PRESETS["Эхо в пещере"], RATE)
+        audio = tone(170, .10)
+        for start in range(0, len(audio), BLOCK):
+            previous = processor.process(audio[start:start + BLOCK], robot, Controls())
+        self.assertGreater(abs(float(previous[-1])), .001)
+        samples = audio[:BLOCK]
         changed = processor.process(samples, echo, Controls())
         self.assertAlmostEqual(float(changed[0]), float(previous[-1]))
         processor.process(samples, echo, Controls())
         processor.process(samples, echo, Controls())
         np.testing.assert_array_equal(processor.process(samples, echo, Controls()), 0.)
+
+    def test_formant_shift_moves_vowel_envelope_without_changing_fundamental(self):
+        fundamental = 112
+        time = np.arange(RATE) / RATE
+        source = np.zeros(RATE)
+        for harmonic in range(1, 35):
+            hz = fundamental * harmonic
+            vowel = np.exp(-.5 * ((hz - 625) / 235)**2) + .46 * np.exp(-.5 * ((hz - 1550) / 370)**2)
+            source += vowel * np.sin(2 * np.pi * hz * time) / harmonic**.35
+        source = (.17 * source / np.max(np.abs(source))).astype(np.float32)
+        down = process(source, replace(BYPASS, formant=-6.))
+        up = process(source, replace(BYPASS, formant=6.))
+
+        def centroid(samples):
+            steady = samples[RATE // 2:]
+            weights = np.abs(np.fft.rfft(steady * np.hanning(len(steady))))**2
+            bins = np.fft.rfftfreq(len(steady), 1 / RATE)
+            return float(np.dot(weights, bins) / weights.sum())
+
+        self.assertGreater(centroid(up), centroid(down) * 1.28)
+        for processed in (down, up):
+            tracker = PitchTracker(RATE)
+            estimate = tracker.update(processed[-len(tracker.window):])
+            self.assertAlmostEqual(estimate, fundamental, delta=1.0)
+
+    def test_trap_preset_enables_pitch_correction_with_global_switch_off(self):
+        source = tone(452, 1.4)
+        corrected = process(source, PRESETS["Трэп-автотюн"])
+        self.assertAlmostEqual(dominant_hz(corrected[-RATE:]), 440, delta=3)
+
+    def test_level_matcher_brings_quiet_and_loud_effects_closer_without_flattening_gain(self):
+        quiet = replace(BYPASS, eq=((200, -19, .65),))
+        loud = replace(BYPASS, eq=((200, 17, .65),))
+        source = tone(200, 1.4)
+        tail = RATE // 3
+        quiet_out = process(source, quiet)[-tail:]
+        loud_out = process(source, loud)[-tail:]
+        ratio = np.sqrt(np.mean(loud_out**2) / np.mean(quiet_out**2))
+        self.assertLess(ratio, 1.55)
+        quieter_input = process(.25 * source, quiet)[-tail:]
+        self.assertGreater(np.sqrt(np.mean(quiet_out**2) / np.mean(quieter_input**2)), 3.3)
 
 
 class DeviceTest(unittest.TestCase):
@@ -227,14 +287,19 @@ class RoutingTest(unittest.TestCase):
         duplex.assert_not_called()
         capture, playback = engine._streams
         self.assertTrue(engine.running)
-        for start in range(0, BLOCK * 12, BLOCK):
-            samples = tone(160)[start:start + BLOCK, None]
+        outputs = []
+        original = tone(160, .10)
+        for start in range(0, BLOCK * 24, BLOCK):
+            samples = original[start:start + BLOCK, None]
             capture.callback(samples, BLOCK, None, None)
-        out = np.full((BLOCK, 2), np.nan, dtype=np.float32)
-        playback.callback(out, BLOCK, None, None)
+            if start >= BLOCK * 8:
+                chunk = np.full((BLOCK, 2), np.nan, dtype=np.float32)
+                playback.callback(chunk, BLOCK, None, None)
+                outputs.append(chunk)
+        out = np.concatenate(outputs)
         self.assertTrue(np.isfinite(out).all())
         self.assertGreater(np.max(np.abs(out)), .001)
-        self.assertFalse(np.allclose(out[:, 0], samples[:, 0]))
+        self.assertFalse(np.allclose(out[:, 0], original[:len(out)]))
 
 
 if __name__ == "__main__":

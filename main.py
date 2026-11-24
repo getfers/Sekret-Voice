@@ -14,7 +14,7 @@ from PIL import Image, ImageOps
 from audio_devices import default_devices, devices
 from audio_engine import AudioEngine, audio_worker
 from dsp import NOTES, SCALES
-from presets import DEFAULT_PRESET, PRESETS
+from presets import CATEGORIES, DEFAULT_PRESET, PRESETS
 
 
 BASE = Path(__file__).resolve().parent
@@ -26,6 +26,7 @@ SURFACE = "#F7F7F7"
 HOVER = "#EDEDED"
 FONT = "Segoe UI"
 EMPTY_DEVICE = "Нет доступных устройств"
+ALL_PRESETS = "Все"
 
 
 def label(parent, value, size=13, bold=False, **kwargs):
@@ -67,11 +68,11 @@ class PresetCard(ctk.CTkFrame):
         super().__init__(parent, fg_color=WHITE, border_color=LINE, border_width=1, corner_radius=10)
         tk.Frame.configure(self, takefocus=1, cursor="hand2")
         self.selected = False
-        title = label(self, name, 14, True)
-        title.pack(anchor="w", padx=13, pady=(11, 3))
+        self.title_label = label(self, name, 14, True, wraplength=153, justify="left", width=1)
+        self.title_label.pack(fill="x", padx=13, pady=(11, 3))
         self.subtitle = label(self, description, 11, text_color=MUTED, wraplength=153, justify="left", width=1)
         self.subtitle.pack(fill="x", padx=13, pady=(0, 10))
-        for part in (self, title, self.subtitle):
+        for part in (self, self.title_label, self.subtitle):
             part.bind("<Button-1>", lambda event: activate(name))
         tk.Misc.bind(self, "<Return>", lambda event: activate(name))
         tk.Misc.bind(self, "<space>", lambda event: activate(name))
@@ -110,6 +111,9 @@ class SekretVoice(ctk.CTk):
         self.audio_tasks = SimpleQueue()
         self.audio_requests = SimpleQueue()
         self.selected = None
+        self.category = ALL_PRESETS
+        self.category_columns = 6
+        self.visible_category_columns = 0
         self.columns = 0
         self.card_wrap = 153
         self.visible_card_wrap = 153
@@ -171,8 +175,8 @@ class SekretVoice(ctk.CTk):
         active_text = ctk.CTkFrame(active, fg_color="transparent")
         active_text.pack(side="left", fill="x", expand=True, padx=16, pady=12)
         label(active_text, "Активный голос", 11, True, text_color=MUTED).pack(anchor="w", pady=(0, 2))
-        self.active_name = label(active_text, "", 25, True)
-        self.active_name.pack(anchor="w")
+        self.active_name = label(active_text, "", 25, True, wraplength=345, justify="left", width=1)
+        self.active_name.pack(fill="x")
         self.active_detail = label(
             active_text, "", 12, text_color=MUTED, width=1, height=31,
             anchor="nw", wraplength=350, justify="left",
@@ -184,6 +188,16 @@ class SekretVoice(ctk.CTk):
         label(section, "Пресеты голоса", 23, True).pack(side="left")
         self.count = label(section, "", 12, text_color=MUTED)
         self.count.pack(side="left", padx=(12, 0), pady=(4, 0))
+        self.category_bar = ctk.CTkFrame(library, fg_color=WHITE, corner_radius=0)
+        self.category_bar.pack(fill="x", pady=(0, 8))
+        self.category_buttons = {
+            category: button(
+                self.category_bar, category, lambda category=category: self._set_category(category),
+                primary=category == ALL_PRESETS, width=1, height=30,
+            )
+            for category in (ALL_PRESETS, *CATEGORIES)
+        }
+        self._layout_categories()
         label(library, "Поиск по названию", 11, text_color=MUTED).pack(anchor="w", pady=(0, 4))
         self.query = tk.StringVar()
         self.search = ctk.CTkEntry(
@@ -260,6 +274,8 @@ class SekretVoice(ctk.CTk):
             button_color=WHITE, button_hover_color=HOVER, command=self._set_tune,
         )
         self.tune_switch.pack(side="right")
+        self.tune_heading = heading
+        self.tune_note = label(tune, "Включён выбранным пресетом", 11, text_color=MUTED)
 
         scale_line = ctk.CTkFrame(tune, fg_color="transparent")
         scale_line.pack(fill="x", padx=10)
@@ -372,8 +388,18 @@ class SekretVoice(ctk.CTk):
     def _set_tune(self):
         enabled = bool(self.tune_switch.get())
         self.engine.controls = replace(self.engine.controls, tune=enabled)
-        for widget in (self.key_menu, self.scale_menu, self.amount_slider):
-            widget.configure(state="normal" if enabled else "disabled")
+        preset_tune = PRESETS[self.selected].tune if self.selected is not None else 0.
+        for widget in (self.key_menu, self.scale_menu):
+            widget.configure(state="normal" if enabled or preset_tune else "disabled")
+        self.amount_slider.configure(state="normal" if enabled else "disabled")
+        strength = self.engine.controls.amount if enabled or not preset_tune else preset_tune
+        percentage = round(strength * 100)
+        self.amount_slider.set(percentage)
+        self.amount_value.configure(text=f"{percentage}%")
+        if preset_tune and not enabled:
+            self.tune_note.pack(after=self.tune_heading, anchor="w", padx=10, pady=(0, 4))
+        else:
+            self.tune_note.pack_forget()
 
     def _set_note(self, value):
         self.engine.controls = replace(self.engine.controls, root=NOTES.index(value))
@@ -398,15 +424,18 @@ class SekretVoice(ctk.CTk):
         self.cards[name].update_selection(True)
         self.active_name.configure(text=name)
         self.active_detail.configure(text=preset.description)
+        self._set_tune()
 
     def _schedule_layout(self, event):
         width = event.width / event.widget._get_widget_scaling()
         target_columns = 3 if width >= 650 else 2
+        category_columns = 6 if width >= 535 else 3
         column_width = width / target_columns
         wrap = 197 if column_width >= 240 else 173 if column_width >= 213 else 153
-        if target_columns == self.columns and wrap == self.card_wrap:
+        if (target_columns, wrap, category_columns) == (self.columns, self.card_wrap, self.category_columns):
             return
         self.columns = target_columns
+        self.category_columns = category_columns
         self.card_wrap = wrap
         if self.layout_job:
             self.after_cancel(self.layout_job)
@@ -414,11 +443,36 @@ class SekretVoice(ctk.CTk):
 
     def _layout_presets(self):
         self.layout_job = None
+        self._layout_categories()
         if self.visible_card_wrap != self.card_wrap:
             for card in self.cards.values():
+                card.title_label.configure(wraplength=self.card_wrap)
                 card.subtitle.configure(wraplength=self.card_wrap)
             self.visible_card_wrap = self.card_wrap
         self._filter_presets()
+
+    def _layout_categories(self):
+        if self.category_columns == self.visible_category_columns:
+            return
+        self.visible_category_columns = self.category_columns
+        for index in range(len(self.category_buttons)):
+            visible = index < self.category_columns
+            self.category_bar.grid_columnconfigure(index, weight=int(visible), uniform="filters" if visible else "")
+        for index, widget in enumerate(self.category_buttons.values()):
+            row, column = divmod(index, self.category_columns)
+            widget.grid(row=row, column=column, sticky="ew", padx=(0, 6), pady=(0, 5))
+
+    def _set_category(self, category):
+        if category == self.category:
+            return
+        self.category = category
+        for name, widget in self.category_buttons.items():
+            selected = name == category
+            widget.configure(
+                fg_color=BLACK if selected else WHITE, text_color=WHITE if selected else BLACK,
+                hover_color="#292929" if selected else HOVER, border_width=0 if selected else 1,
+            )
+        self._search_changed()
 
     def _focus_search(self, event):
         self.search.focus_set()
@@ -438,9 +492,10 @@ class SekretVoice(ctk.CTk):
 
     def _filter_presets(self):
         query = self.query.get().casefold().strip().replace("ё", "е")
-        if query == getattr(self, "_last_query", None) and self.columns == getattr(self, "_last_columns", None):
+        filter_state = query, self.category, self.columns
+        if filter_state == getattr(self, "_last_filter", None):
             return
-        self._last_query, self._last_columns = query, self.columns
+        self._last_filter = filter_state
         count = self.columns or 3
         for i in range(3):
             self.cards_area.grid_columnconfigure(i, weight=int(i < count), uniform="cards" if i < count else "")
@@ -449,8 +504,11 @@ class SekretVoice(ctk.CTk):
         self._visible_columns = count
         self.visible_presets = []
         self.no_results.grid_forget()
+        category_size = 0
         for name, card in self.cards.items():
-            if query in name.casefold().replace("ё", "е"):
+            in_category = self.category == ALL_PRESETS or PRESETS[name].category == self.category
+            category_size += int(in_category)
+            if in_category and query in name.casefold().replace("ё", "е"):
                 row, column = divmod(len(self.visible_presets), count)
                 old_index = previous_positions.get(name)
                 if old_index is None or divmod(old_index, previous_columns) != (row, column):
@@ -459,7 +517,7 @@ class SekretVoice(ctk.CTk):
             elif name in previous_positions:
                 card.grid_remove()
         shown = len(self.visible_presets)
-        self.count.configure(text=f"{shown} / {len(PRESETS)}" if query else str(len(PRESETS)))
+        self.count.configure(text=f"{shown} / {category_size}" if query else str(category_size))
         if not shown:
             self.no_results.grid(row=0, column=0, columnspan=count, sticky="w", padx=1, pady=17)
 
